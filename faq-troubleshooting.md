@@ -476,6 +476,182 @@ return 对象 → response_model 校验 → 序列化 JSON → 发给客户端
 
 ---
 
+---
+
+## Day 2 — 工程化重构
+
+### 12. 相对导入 `from .routers import chat` 报 `ImportError`
+
+**现象**：
+
+```
+ImportError: attempted relative import with no known parent package
+```
+
+**原因**：直接 `python app/main.py` 运行时，Python 不认为 `app/` 是一个包，`.` 相对导入失效。
+
+**解决**：用 `uvicorn` 启动，它会正确处理包结构：
+
+```bash
+uvicorn app.main:app --reload
+```
+
+**知识点**：
+- `.` = 从当前包开始找，`..` = 上一层包
+- 相对导入只在包（package）上下文里有效
+- 永远用 `uvicorn` 启动 FastAPI 项目，不要 `python xxx.py`
+
+---
+
+### 13. 启动命令换了：`main:app` → `app.main:app`
+
+**原因**：Day 2 重构后，`app = FastAPI()` 从 `main.py` 移到了 `app/main.py`。
+
+**知识**：`uvicorn <模块路径>:<实例名>`，模块路径用 `.` 分隔目录。
+
+---
+
+## Day 3-4 — LangChain + DeepSeek 踩坑
+
+### 14. `init_chat_model("claude-sonnet-4-6")` 怎么知道 DeepSeek 地址？
+
+**答案**：读取环境变量。DeepSeek Anthropic 端点需要两个：
+
+```bash
+export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+export ANTHROPIC_API_KEY="sk-xxx"
+```
+
+**注意**：DeepSeek 的 Anthropic 端点和 OpenAI 端点**不是同一套环境变量**。混用会报认证错误。
+
+---
+
+### 15. LangChain 文档 v1.0 大改——新旧 API 混淆
+
+**现象**：跟旧版教程写 `from langchain.prompts import ChatPromptTemplate` → 找不到，或者 API 签名不一样。
+
+**原因**：`docs.langchain.com`（新版）入口是 `create_agent` + `@tool`；旧版 `python.langchain.com/v0.1/` 才有六大模块和 LCEL。
+
+**对策**：
+- 学概念看旧版（面试考）
+- 写代码用新版（`create_agent`、`init_chat_model`、`stream_events v3`）
+
+---
+
+### 16. `langchain.agents` vs `langchain.chat_models` 导入路径
+
+新版导入：
+
+```python
+from langchain.agents import create_agent       # Agent
+from langchain.chat_models import init_chat_model  # 模型
+from langchain.tools import tool                # @tool 装饰器
+```
+
+不需要单独装 `langchain-openai` / `langchain-anthropic` — `init_chat_model` 根据模型名字符串自动选。
+
+---
+
+## Day 6 — FastAPI + LangChain 整合踩坑
+
+### 17. `agent.invoke()` 报 `ValidationError: reply - Input should be a valid string`
+
+**现象**：
+
+```
+pydantic_core._pydantic_core.ValidationError: 1 validation error for ChatResponse
+reply
+  Input should be a valid string [type=string_type, input_value=[{...}, {...}], input_type=list]
+```
+
+**原因**：DeepSeek 返回的 `AIMessage.content` 不是纯字符串，是一个列表：
+
+```python
+[
+    {"type": "reasoning", "reasoning": "...", "signature": "xxx"},
+    {"type": "text", "text": "北京今天晴，25°C"}
+]
+```
+
+`ChatResponse.reply: str` 要求字符串，收到 list → 校验失败。
+
+**解决**：
+
+```python
+last_msg = result["messages"][-1]
+if isinstance(last_msg.content, list):
+    reply_text = "".join(
+        b["text"] for b in last_msg.content if b.get("type") == "text"
+    )
+else:
+    reply_text = last_msg.content
+```
+
+**知识点**：
+- `.content` → 可能返回 str 或 list（取决于模型/端点）
+- `.content_blocks` → 永远返回 list
+- DeepSeek Anthropic 端点返回包含 `reasoning` 和 `text` 两类块的列表
+- 写 Agent 服务时**防御性判断 `isinstance(content, list)`** 是必要的
+
+---
+
+### 18. `agent.invoke()` 不能传字符串，`model.invoke()` 可以
+
+```python
+# ✅ model.invoke 接受字符串
+model.invoke("你好")
+
+# ❌ agent.invoke 不接受字符串，必须是 {"messages": [...]}
+agent.invoke({"messages": [{"role": "user", "content": "你好"}]})
+```
+
+**原因**：Agent 底层是 LangGraph 状态图，入参必须是完整的状态字典（含 `messages` 键）。Model 是底层裸接口，宽松得多。
+
+---
+
+### 19. Agent 实例应该放在模块级，不是函数内
+
+```python
+# ✅ 正确：模块级，启动时创建一次
+agent = create_agent(model=..., tools=[...])
+
+@router.post("/")
+async def chat(request: ChatRequest):
+    result = agent.invoke(...)
+
+# ❌ 错误：每次请求重新创建（200-500ms 开销）
+@router.post("/")
+async def chat(request: ChatRequest):
+    agent = create_agent(model=..., tools=[...])  # 每次请求都编译图
+```
+
+**原因**：`create_agent` 内部编译 LangGraph 图，耗时 200-500ms。放模块级只编译一次。
+
+---
+
+## Day 7 — Git
+
+### 20. `git branch -m main` 在空仓库报错
+
+**现象**：
+
+```
+error: refname refs/heads/master not found
+fatal: Branch rename failed
+```
+
+**原因**：改名必须在第一次 commit 之后，commit 之前分支还不存在。
+
+**解决**：先 commit 再改名：
+
+```bash
+git add -A
+git commit -m "first commit"
+git branch -m main
+```
+
+---
+
 ## 总结：Day 1 部署踩坑全景
 
 ```
